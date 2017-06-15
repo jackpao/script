@@ -1,4 +1,13 @@
 #!/usr/bin/python
+"""
+
+Python code to remotely ssh connect to a host, and return 
+command output
+
+"""
+
+
+
 from subprocess import PIPE,Popen
 
 HOST="10.1.132.93"
@@ -6,16 +15,34 @@ HOST="10.1.132.93"
 COMMAND="ssh  nutanix@10.1.132.93 ps axf |grep python |wc -l"
 
 
-output = Popen(['ssh', HOST, 'ps axf|grep python|wc -l'],stdout=PIPE)
 
-out = output.communicate()[0]
+A = "10.1.132."
+Host_list = []
 
-print "out check"
-print out
-if out >= 30:
-  print "check done"
+fail_list = []
+
+for i in xrange(92,96):
+  Host_list.append(A + str(i))
+
+
+print Host_list
+
+for i in Host_list:
+  print i
+
+  output = Popen(['ssh', i, 'ps axf|grep python|wc -l'],stdout=PIPE)
+  
+  #command output
+  out = output.communicate()[0]
+
+  print "out check"
   print out
-else:
-  print "check if fail"
+  if int(out) >= 35:
+    print "check done"
+    print i
+  else:
+    print "check if fail"
+    fail_list.append(i)
 
+print fail_list
 
