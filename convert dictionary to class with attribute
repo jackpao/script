@@ -1,0 +1,12 @@
+#convert dictionary to class with attribute
+def jack(d):
+  if not isinstance(d, dict):
+  	return d
+  o = lambda: None
+  for k, v in d.items():
+    setattr(o, k, jack(v))
+  return o
+ 
+d = {'a': 1, "b": {"c": 2, "d": {"e": 3}}}
+o = jack(d)
+print o, o.a, o.b.c, o.b.d.e
