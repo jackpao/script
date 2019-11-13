@@ -1,0 +1,368 @@
+#! /bin/bash
+
+set -x
+
+MODE_R="randwrite randread"
+MODE_S="write read"
+MODE_READ="read randread"
+MODE_WRITE="write randwrite"
+BLOCK_SIZE="4k 128k 256k"
+#BLOCK_SIZE="128k"
+#BLOCK_NUM="4 256"
+NUMJOBS="16"
+IOENGINE="libaio sync"
+DIRECT="1"
+SIZE="20G"
+HOSTS="angel-a angel-b angel-c"
+FIO_MVFS_ROOT="/opt/MemVergeDMO/tools"
+MOUNT_DIR="/mnt/dmo_perf2 /mnt/nvme1"
+FIO_MVFS_DIR="/home/jackp/perf_local_new_mvfs"
+ROOT="/opt"
+master_node="angel-a"
+
+yaml="dmo.yaml"
+sock="dmo.daemon.sock.0"
+disable_latency=0
+output_dir="/home/"
+
+export LD_LIBRARY_PATH=$ROOT/MemVergeDMO/lib
+
+setup_agent_environment()
+{
+	$ROOT/sshh stop
+	sleep 20
+	$ROOT/sshh kill
+	sleep 10
+	ssh aep3 "cd /opt/Pingan/MemVergeDMO/bin; ./dmocluster root $ROOT/$yaml /opt/Pingan stop"
+	sleep 10
+	$*
+	ssh aep3 "cd /opt/Pingan/MemVergeDMO/bin; ./dmocluster root $ROOT/$yaml /opt/Pingan setup"
+	sleep 10
+	ssh aep3 "cd /opt/Pingan/MemVergeDMO/bin; ./dmocluster root $ROOT/$yaml /opt/Pingan start"
+	sleep 10
+	$ROOT/sshh start
+}
+
+setup_fuse_environment()
+{
+	$ROOT/sshh "/opt/Pingan/MemVergeDMO/bin/dmofs-umount /mnt/pingan"
+	sleep 10
+	setup_agent_environment $*
+	sleep 20
+	$ROOT/sshh "/opt/Pingan/MemVergeDMO/bin/dmofs-mount /mnt/pingan -o socket=pingan.x -o chunksize=16384 -o clone_fd"
+}
+
+dmo_reset()
+{
+	path=$(pwd)
+	cd $ROOT/MemVergeDMO/bin
+	./dmocluster root $ROOT/$yaml $ROOT stop
+	sleep 10
+	./dmocluster root $ROOT/$yaml $ROOT setup
+	sleep 10
+	./dmocluster root $ROOT/$yaml $ROOT start
+	cd $path
+}
+
+localpmem_rmdir()
+{
+	$ROOT/MemVergeDMO/bin/dmocli -socket_path $sock -action df
+	$ROOT/MemVergeDMO/bin/dmocli -socket_path $sock -action rmdir -path /perf
+	#  df -h
+	#  rm -fr /mnt/pmem0/*
+	#  sleep 10
+	#  df -h
+	$ROOT/MemVergeDMO/bin/dmocli -socket_path $sock -action df
+}
+
+local_rmdir()
+{
+	df -h $mount_point
+	for i in $HOSTS;do
+		echo $i
+		ssh root@$i "rm -fr ${mount_point}/*"
+		df -h $mount_point
+	done
+	sleep 10
+}
+
+dmo_rmdir()
+{
+	$ROOT/MemVergeDMO/bin/dmocli -socket_path $sock -action df
+	$ROOT/MemVergeDMO/bin/dmocli -socket_path $sock -action rmdir -path $FIO_MVFS_DIR
+	sleep 10
+	$ROOT/MemVergeDMO/bin/dmocli -socket_path $sock -action df
+}
+
+deploy_package()
+{
+	$ROOT/sshh "rm -rf /opt/Pingan/MemVergeDMO/"
+	$ROOT/sshh "tar xzf $1 -C /opt/Pingan"
+}
+
+dump_rpcstats()
+{
+	$ROOT/sshh a_rpcstats >> agent_rpcstats-$(date +%F-%H).txt
+	$ROOT/sshh a_opstats >> agent_opstats-$(date +%F-%H).txt
+	$ROOT/sshh s_rpcstats >> server_rpcstats-$(date +%F-%H).txt
+	$ROOT/sshh s_opstats >> server_opstats-$(date +%F-%H).txt
+	$ROOT/sshh a_rpcreset
+	$ROOT/sshh a_opreset
+	$ROOT/sshh s_rpcreset
+	$ROOT/sshh s_opreset
+}
+
+mount_fuse()
+{
+	$ROOT/MemVergeDMO/bin/dmofs-umount $mount_point
+	$ROOT/MemVergeDMO/bin/dmofs-mount $mount_point -o socket=$sock -o chunksize=$chunk_sz_num -o clone_fd
+}
+
+fuse_option_generator()
+{
+	option_main="--name=$jobname 
+	--directory=/mnt/pingan 
+	--ioengine=$eng 
+	--rw=$rw 
+	--bs=$bs 
+	--size=$sz 
+	--numjobs=$jobnum 
+	--direct=$direct
+	--nrfiles=$nr
+	--openfiles=$nropen"
+	option_extra="-group_reporting --thread=1"
+	if [ $disable_latency -gt 0 ]; then
+		option_extra+=" --disable_lat=1 --disable_clat=1 --disable_slat=1 "
+	fi
+	option_output="--output=${output_dir}/${jobname}.$(date +%F-%H).json --output-format=json+"
+}
+
+mvfs_option_generator()
+{
+	option_main="--name=$jobname 
+	--ioengine=mvfs 
+	--socket_path=$sock
+	--rw=$rw 
+	--bs=$bs 
+	--size=$sz
+	--numjobs=$jobnum
+	--direct=$direct 
+	--chunk_size=$chunk_sz
+	--nrfiles=$nr
+	--openfiles=$nropen"
+	option_extra=" --invalidate=0 -group_reporting --thread=1"
+	if [ $disable_latency -gt 0 ]; then
+		option_extra+=" --disable_lat=1 --disable_clat=1 --disable_slat=1 "
+	fi
+	option_output="--output=${output_dir}/${jobname}.$(date +%F-%H).json --output-format=json+"
+}
+
+mvfs_jobfile_generator()
+{
+	jobfile=${1}
+	echo "[global]" > $jobfile
+	echo "ioengine=mvfs" >> $jobfile
+	echo "socket_path=$sock" >> $jobfile
+	echo "invalidate=0" >> $jobfile
+	if [ ${disable_latency:-0} -gt 0 ]; then
+		echo "disable_lat=0" >> $jobfile
+		echo "disable_clat=0" >> $jobfile
+		echo "disable_slat=0" >> $jobfile
+	fi
+	echo "group_reporting" >> $jobfile
+	echo "create_on_open=1" >> $jobfile
+	echo "thread=1" >> $jobfile
+	echo "[$jobname]" >> $jobfile
+	echo "chunk_size=$chunk_sz" >> $jobfile
+	echo "size=$sz" >> $jobfile
+	echo "bs=$bs" >> $jobfile
+	echo "nrfiles=$nr" >> $jobfile
+	echo "openfiles=$nropen" >> $jobfile
+	echo "numjobs=$jobnum" >> $jobfile
+	echo "rw=$rw" >> $jobfile
+        echo "directory=$mount_point" >> $jobfile
+	
+}
+
+fuse_jobfile_generator()
+{
+	jobfile=${1}
+	echo "[global]" > $jobfile
+	echo "ioengine=$eng" >> $jobfile
+	if [ ${disable_latency:-0} -gt 0 ]; then
+		echo "disable_lat=0" >> $jobfile
+		echo "disable_clat=0" >> $jobfile
+		echo "disable_slat=0" >> $jobfile
+	fi
+	echo "group_reporting" >> $jobfile
+	echo "disk_util=0" >> $jobfile
+	echo "thread=1" >> $jobfile
+	echo "directory=$mount_point" >> $jobfile
+	echo "[$jobname]" >> $jobfile
+	echo "size=$sz" >> $jobfile
+	echo "bs=$bs" >> $jobfile
+	echo "nrfiles=$nr" >> $jobfile
+	echo "openfiles=$nropen" >> $jobfile
+	echo "numjobs=$jobnum" >> $jobfile
+	echo "rw=$rw" >> $jobfile
+	if [[ $eng = "libaio" ]];then
+		echo "direct=1" >> $jobfile
+	else
+		echo "direct=0" >> $jobfile
+	fi
+}
+
+job_preset_4k()
+{
+	sz="400000k"
+	bs="4k"
+	chunk_sz="4k"
+	nr="100000"
+	nropen="1000"
+	jobnum="8"
+}
+
+job_preset_16k()
+{
+	sz="1600000k"
+	bs="4k"
+	chunk_sz="16k"
+	nr="100000"
+	nropen="1000"
+	jobnum="8"
+}
+
+job_preset_256k()
+{
+	sz="10G"
+	bs="256k"
+	chunk_sz="2m"
+	nr="1"
+	nropen="1"
+	jobnum="8"
+}
+
+job_full_iosize_pmem_local()
+{
+  sz=$SIZE
+  nr="1"
+  nropen="1"
+  for mount_point in $MOUNT_DIR;do
+    for bs in $BLOCK_SIZE;do
+      if [[ $bs = "128k" ]] || [[ $bs = "256k" ]];then
+        MODE=$MODE_S
+      else
+        MODE=$MODE_R	      
+      fi
+      for eng in $IOENGINE; do
+        for direct in $DIRECT; do
+          for rw in $MODE; do
+            for jobnum in $NUMJOBS; do
+              option_main=""
+              for host in $HOSTS; do
+              	jobname="fuse-${host}-${direct}-${rw}-${bs}-${jobnum}t"
+          	fiojob="${host}-${rw}-${bs}.fio"
+                  fuse_jobfile_generator $fiojob
+                  option_main+=" --client=$host $fiojob "
+              done
+	      if [[ $mount_point = "/mnt/nvme1"  ]];then
+	        mt="_nvme1"
+	      else
+	        mt="_dmofuse1"
+	      fi
+              /usr/bin/fio $option_main $option_extra $option_output > fio_M${mt}1_J${jobnum}_B${bs}_${eng}_${rw}_result.txt 
+              if [[ $mount_point = "/mnt/nvme1"  ]];then
+	        local_rmdir
+	      else
+	        local_rmdir
+	      fi
+            done
+          done
+        done
+      done
+    done
+  done
+}
+
+job_full_iosize_mvfs_local()
+{
+  sz=$SIZE
+  nr="1"
+  nropen="1"
+  mount_point=$FIO_MVFS_DIR
+    for bs in $BLOCK_SIZE;do
+      if [[ $bs = "128k" ]] || [[ $bs = "256k" ]];then
+        chunk_sz=$bs
+        MODE=$MODE_S
+      else
+        MODE=$MODE_R
+        chunk_sz="64k"	
+      fi
+        for direct in $DIRECT; do
+          for rw in $MODE; do
+            for jobnum in $NUMJOBS; do
+              option_main=""
+              for host in $HOSTS; do
+            	jobname="mvfs-${host}-${direct}-${rw}-${bs}-${jobnum}t"
+          	fiojob="${host}-${rw}-${bs}.fio"
+                  mvfs_jobfile_generator $fiojob
+                  option_main+=" --client=$host $fiojob "
+              done
+	      $FIO_MVFS_ROOT/fio $option_main $option_extra $option_output > fiomvfs1_J${jobnum}_B${bs}_${eng}_${rw}_result.txt 
+	      dmo_rmdir
+	      sleep 30
+            done
+          done
+        done
+      done
+}
+
+job_full_iosize_fuse_local()
+{
+  sz="5G"
+  nr="1"
+  nropen="1"
+  for bs_num in $BLOCK_NUM; do
+    chunk_sz_num=$((bs_num * 8192))
+    bs="${bs_num}k"
+    mount_fuse
+    sleep 10
+    for eng in $IOENGINE; do
+      for direct in $DIRECT; do
+        for rw in $MODE; do
+          for jobnum in $NUMJOBS; do
+  	    jobname="fuse-${direct}-${rw}-${bs}-${jobnum}t"
+	    fuse_option_generator
+            $FIO_MVFS_ROOT/fio.bin $option_main $option_extra $option_output 
+	    dmo_rmdir
+          done
+        done
+      done
+    done
+  done
+}
+
+main()
+{
+   if [[ $run_mode = "mvfs"  ]];then
+     echo "run_mode is $run_mode"
+     job_full_iosize_mvfs_local
+   else
+     job_full_iosize_pmem_local
+   fi
+   sh parser.sh
+}
+
+run_mode=$1
+main
+#mount_point=$2
+
+#if [[ $run_mode = "dmo"  ]];then
+#  echo "mode is $run_mode"
+##  echo "mount_point is $2"
+#  main $run_mode
+#elif [[ $run_mode = "nvme"  ]];then
+#  echo "mode is $mode"
+##  echo "mount_point is $2"
+#else
+#  echo "$mode not recognized"
